@@ -3,42 +3,39 @@ package hyperv
 import (
 	"fmt"
 	"net"
-	"os"
 	"time"
 
 	"github.com/code-ready/machine/libmachine/drivers"
 	"github.com/code-ready/machine/libmachine/log"
 	"github.com/code-ready/machine/libmachine/mcnflag"
-	"github.com/code-ready/machine/libmachine/mcnutils"
-	"github.com/code-ready/machine/libmachine/ssh"
 	"github.com/code-ready/machine/libmachine/state"
 )
 
 type Driver struct {
 	*drivers.BaseDriver
-	Boot2DockerURL       string
-	VSwitch              string
-	DiskSize             int
-	MemSize              int
+	CrcDiskCopier        CRCDiskCopier
+	BundlePath           string
+	VirtualSwitch        string
+	DiskPath             string
+	DiskPathUrl          string
+	Memory               int
 	CPU                  int
-	MacAddr              string
-	VLanID               int
+	MacAddress           string
 	DisableDynamicMemory bool
+	SSHKeyPath           string
 }
 
 const (
-	defaultDiskSize             = 20000
-	defaultMemory               = 1024
-	defaultCPU                  = 1
-	defaultVLanID               = 0
+	defaultMemory               = 8192
+	defaultCPU                  = 4
 	defaultDisableDynamicMemory = false
 )
 
 // NewDriver creates a new Hyper-v driver with default settings.
 func NewDriver(hostName, storePath string) *Driver {
 	return &Driver{
-		DiskSize:             defaultDiskSize,
-		MemSize:              defaultMemory,
+		CrcDiskCopier:        NewCRCDiskCopier(),
+		Memory:               defaultMemory,
 		CPU:                  defaultCPU,
 		DisableDynamicMemory: defaultDisableDynamicMemory,
 		BaseDriver: &drivers.BaseDriver{
@@ -53,20 +50,14 @@ func NewDriver(hostName, storePath string) *Driver {
 func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 	return []mcnflag.Flag{
 		mcnflag.StringFlag{
-			Name:   "hyperv-boot2docker-url",
-			Usage:  "URL of the boot2docker ISO. Defaults to the latest available version.",
-			EnvVar: "HYPERV_BOOT2DOCKER_URL",
+			Name:   "hyperv-bundlepath-url",
+			Usage:  "URL of the crc bundlepath. Defaults to the latest available version.",
+			EnvVar: "HYPERV_BUNDLEPATH_URL",
 		},
 		mcnflag.StringFlag{
 			Name:   "hyperv-virtual-switch",
 			Usage:  "Virtual switch name. Defaults to first found.",
 			EnvVar: "HYPERV_VIRTUAL_SWITCH",
-		},
-		mcnflag.IntFlag{
-			Name:   "hyperv-disk-size",
-			Usage:  "Maximum size of dynamically expanding disk in MB.",
-			Value:  defaultDiskSize,
-			EnvVar: "HYPERV_DISK_SIZE",
 		},
 		mcnflag.IntFlag{
 			Name:   "hyperv-memory",
@@ -85,12 +76,6 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "Hyper-V network adapter's static MAC address.",
 			EnvVar: "HYPERV_STATIC_MACADDRESS",
 		},
-		mcnflag.IntFlag{
-			Name:   "hyperv-vlan-id",
-			Usage:  "Hyper-V network adapter's VLAN ID if any",
-			Value:  defaultVLanID,
-			EnvVar: "HYPERV_VLAN_ID",
-		},
 		mcnflag.BoolFlag{
 			Name:   "hyperv-disable-dynamic-memory",
 			Usage:  "Disable dynamic memory management setting",
@@ -100,22 +85,23 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 }
 
 func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
-	d.Boot2DockerURL = flags.String("hyperv-boot2docker-url")
-	d.VSwitch = flags.String("hyperv-virtual-switch")
-	d.DiskSize = flags.Int("hyperv-disk-size")
-	d.MemSize = flags.Int("hyperv-memory")
+	d.BundlePath = flags.String("hyperv-bundlepath-url")
+	d.VirtualSwitch = flags.String("hyperv-virtual-switch")
+	d.Memory = flags.Int("hyperv-memory")
 	d.CPU = flags.Int("hyperv-cpu-count")
-	d.MacAddr = flags.String("hyperv-static-macaddress")
-	d.VLanID = flags.Int("hyperv-vlan-id")
-	d.SSHUser = "docker"
+	d.MacAddress = flags.String("hyperv-static-macaddress")
+	d.SSHUser = drivers.DefaultSSHUser
 	d.DisableDynamicMemory = flags.Bool("hyperv-disable-dynamic-memory")
-	d.SetSwarmConfigFromFlags(flags)
 
 	return nil
 }
 
 func (d *Driver) GetSSHHostname() (string, error) {
 	return d.GetIP()
+}
+
+func (d *Driver) GetSSHKeyPath() string {
+	return d.SSHKeyPath
 }
 
 // DriverName returns the name of the driver
@@ -183,21 +169,11 @@ func (d *Driver) PreCreateCheck() error {
 		return err
 	}
 
-	// Downloading boot2docker to cache should be done here to make sure
-	// that a download failure will not leave a machine half created.
-	b2dutils := mcnutils.NewB2dUtils(d.StorePath)
-	err = b2dutils.UpdateISOCache(d.Boot2DockerURL)
 	return err
 }
 
 func (d *Driver) Create() error {
-	b2dutils := mcnutils.NewB2dUtils(d.StorePath)
-	if err := b2dutils.CopyIsoToMachineDir(d.Boot2DockerURL, d.MachineName); err != nil {
-		return err
-	}
-
-	log.Infof("Creating SSH key...")
-	if err := ssh.GenerateSSHKey(d.GetSSHKeyPath()); err != nil {
+	if err := d.CrcDiskCopier.CopyDiskToMachineDir(d.StorePath, d.MachineName, d.DiskPathUrl); err != nil {
 		return err
 	}
 
@@ -209,16 +185,11 @@ func (d *Driver) Create() error {
 
 	log.Infof("Using switch %q", virtualSwitch)
 
-	diskImage, err := d.generateDiskImage()
-	if err != nil {
-		return err
-	}
-
 	if err := cmd("Hyper-V\\New-VM",
 		d.MachineName,
 		"-Path", fmt.Sprintf("'%s'", d.ResolveStorePath(".")),
 		"-SwitchName", quote(virtualSwitch),
-		"-MemoryStartupBytes", toMb(d.MemSize)); err != nil {
+		"-MemoryStartupBytes", toMb(d.Memory)); err != nil {
 		return err
 	}
 	if d.DisableDynamicMemory {
@@ -237,32 +208,17 @@ func (d *Driver) Create() error {
 		}
 	}
 
-	if d.MacAddr != "" {
+	if d.MacAddress != "" {
 		if err := cmd("Hyper-V\\Set-VMNetworkAdapter",
 			"-VMName", d.MachineName,
-			"-StaticMacAddress", fmt.Sprintf("\"%s\"", d.MacAddr)); err != nil {
+			"-StaticMacAddress", fmt.Sprintf("\"%s\"", d.MacAddress)); err != nil {
 			return err
 		}
-	}
-
-	if d.VLanID > 0 {
-		if err := cmd("Hyper-V\\Set-VMNetworkAdapterVlan",
-			"-VMName", d.MachineName,
-			"-Access",
-			"-VlanId", fmt.Sprintf("%d", d.VLanID)); err != nil {
-			return err
-		}
-	}
-
-	if err := cmd("Hyper-V\\Set-VMDvdDrive",
-		"-VMName", d.MachineName,
-		"-Path", quote(d.ResolveStorePath("boot2docker.iso"))); err != nil {
-		return err
 	}
 
 	if err := cmd("Hyper-V\\Add-VMHardDiskDrive",
 		"-VMName", d.MachineName,
-		"-Path", quote(diskImage)); err != nil {
+		"-Path", quote(d.DiskPath)); err != nil {
 		return err
 	}
 
@@ -271,8 +227,8 @@ func (d *Driver) Create() error {
 }
 
 func (d *Driver) chooseVirtualSwitch() (string, error) {
-	if d.VSwitch == "" {
-		// Default to the first external switche and in the process avoid DockerNAT
+	if d.VirtualSwitch == "" {
+		// Default to the first external switch and in the process avoid DockerNAT
 		stdout, err := cmdOut("[Console]::OutputEncoding = [Text.Encoding]::UTF8; (Hyper-V\\Get-VMSwitch -SwitchType External).Name")
 		if err != nil {
 			return "", err
@@ -281,7 +237,7 @@ func (d *Driver) chooseVirtualSwitch() (string, error) {
 		switches := parseLines(stdout)
 
 		if len(switches) < 1 {
-			return "", fmt.Errorf("no External vswitch found. A valid vswitch must be available for this command to run. Check https://docs.docker.com/machine/drivers/hyper-v/")
+			return "", fmt.Errorf("no external virtual switch found. A valid virtual switch must be available for this command to run")
 		}
 
 		return switches[0], nil
@@ -296,17 +252,17 @@ func (d *Driver) chooseVirtualSwitch() (string, error) {
 
 	found := false
 	for _, name := range switches {
-		if name == d.VSwitch {
+		if name == d.VirtualSwitch {
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		return "", fmt.Errorf("vswitch %q not found", d.VSwitch)
+		return "", fmt.Errorf("virtual switch %q not found", d.VirtualSwitch)
 	}
 
-	return d.VSwitch, nil
+	return d.VirtualSwitch, nil
 }
 
 // waitForIP waits until the host has a valid IP
@@ -433,60 +389,4 @@ func (d *Driver) GetIP() (string, error) {
 	}
 
 	return resp[0], nil
-}
-
-func (d *Driver) publicSSHKeyPath() string {
-	return d.GetSSHKeyPath() + ".pub"
-}
-
-// generateDiskImage creates a small fixed vhd, put the tar in, convert to dynamic, then resize
-func (d *Driver) generateDiskImage() (string, error) {
-	diskImage := d.ResolveStorePath("disk.vhd")
-	fixed := d.ResolveStorePath("fixed.vhd")
-
-	// Resizing vhds requires administrator privileges
-	// incase the user is only a hyper-v admin then create the disk at the target size to avoid resizing.
-	isWindowsAdmin, err := isWindowsAdministrator()
-	if err != nil {
-		return "", err
-	}
-	fixedDiskSize := "10MB"
-	if !isWindowsAdmin {
-		fixedDiskSize = toMb(d.DiskSize)
-	}
-
-	log.Infof("Creating VHD")
-	if err := cmd("Hyper-V\\New-VHD", "-Path", quote(fixed), "-SizeBytes", fixedDiskSize, "-Fixed"); err != nil {
-		return "", err
-	}
-
-	tarBuf, err := mcnutils.MakeDiskImage(d.publicSSHKeyPath())
-	if err != nil {
-		return "", err
-	}
-
-	file, err := os.OpenFile(fixed, os.O_WRONLY, 0644)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	file.Seek(0, os.SEEK_SET)
-	_, err = file.Write(tarBuf.Bytes())
-	if err != nil {
-		return "", err
-	}
-	file.Close()
-
-	if err := cmd("Hyper-V\\Convert-VHD", "-Path", quote(fixed), "-DestinationPath", quote(diskImage), "-VHDType", "Dynamic", "-DeleteSource"); err != nil {
-		return "", err
-	}
-
-	if isWindowsAdmin {
-		if err := cmd("Hyper-V\\Resize-VHD", "-Path", quote(diskImage), "-SizeBytes", toMb(d.DiskSize)); err != nil {
-			return "", err
-		}
-	}
-
-	return diskImage, nil
 }
