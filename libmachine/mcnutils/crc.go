@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/code-ready/machine/libmachine/log"
 )
@@ -231,6 +233,22 @@ func (b *B2dUtils) CopyDiskToMachineDir(diskURL, machineName string) error {
 	if diskURL == "" {
 		log.Infof("Copying %s to %s...", b.path(), machineIsoPath)
 		return CopyFile(b.path(), machineIsoPath)
+	} else if strings.HasPrefix(diskURL, "file:") {
+		// Local disk image so we can avoid copying by making use of backing image feature of qcow2
+		components := strings.Split(diskURL, "://")
+		if len(components) < 2 {
+			return fmt.Errorf("Invalid URL: %s", diskURL)
+		}
+		diskPath := components[1]
+		log.Infof("Create disk image at %s (backing store: %s)", machineIsoPath, diskPath)
+		command := exec.Command("qemu-img", "create", "-b", diskPath, "-f", "qcow2", machineIsoPath)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			log.Warnf("Error occurred running `%s` command: %s", command.String(), err)
+		}
+		log.Debugf("Output of `%s` command:\n%s", command.String(), output)
+
+		return err
 	}
 
 	return b.DownloadDisk(machineDir, b.filename(), diskURL)
