@@ -27,6 +27,8 @@ type Driver interface {
 	// GetBundleName() Returns the name of the unpacked bundle which was used to create this machine
 	GetBundleName() (string, error)
 
+	GetSharedDirs() ([]SharedDir, error)
+
 	// GetState returns the state that the host is in (running, stopped, etc)
 	GetState() (state.State, error)
 

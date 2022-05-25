@@ -67,3 +67,7 @@ func (d *Driver) Remove() error {
 func (d *Driver) Upgrade() error {
 	return nil
 }
+
+func (d *Driver) GetSharedDirs() ([]drivers.SharedDir, error) {
+	return []drivers.SharedDir{}, nil
+}
