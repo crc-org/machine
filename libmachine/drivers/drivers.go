@@ -56,6 +56,7 @@ type Driver interface {
 
 var ErrHostIsNotRunning = errors.New("Host is not running")
 var ErrNotImplemented = errors.New("Not Implemented")
+var ErrNotSupported = errors.New("Not Supported")
 
 func MachineInState(d Driver, desiredState state.State) func() bool {
 	return func() bool {
