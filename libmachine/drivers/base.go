@@ -78,5 +78,5 @@ func (d *BaseDriver) UpdateConfigRaw(rawData []byte) error {
 }
 
 func (d *VMDriver) GetSharedDirs() ([]SharedDir, error) {
-	return d.SharedDirs, nil
+	return nil, ErrNotImplemented
 }
